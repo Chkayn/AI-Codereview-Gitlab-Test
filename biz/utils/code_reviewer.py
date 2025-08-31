@@ -87,14 +87,59 @@ class CodeReviewer(BaseReviewer):
 
     def review_code(self, diffs_text: str, commits_text: str = "") -> str:
         """Review 代码并返回结果"""
+        # 1) 从 Diff 中提取“新增代码”
+        from biz.utils.code_parser import GitDiffParser
+        parser = GitDiffParser(diffs_text)
+        new_code = parser.get_new_code()  # 仅对新增部分做依赖分析
+
+        # 2) AST 解析 + 正则回退，抽取依赖关键词
+        from biz.utils.ast_util import extract_dependencies_from_code
+        dependencies = extract_dependencies_from_code(new_code)
+        dep_display = ", ".join(dependencies[:20]) + (" ..." if len(dependencies) > 20 else "")
+
+        # 3) 基于依赖做向量检索（带降级策略）
+        related_context_blocks = []
+        try:
+            from biz.utils.vector_store import VectorStore
+            top_k = int(os.getenv("DEP_TOP_K", 5))
+            store = VectorStore()  # 默认 data/vector_store.json
+            hits = store.search_similar(dependencies, top_k=top_k)
+
+            for i, item in enumerate(hits, start=1):
+                # item: {"id","name","text","score"}
+                related_context_blocks.append(
+                    f"[{i}] {item.get('name','')}\nscore={item.get('score',0):.4f}\n{item.get('text','')}"
+                )
+        except Exception as e:
+            logger.warning(f"依赖向量检索失败或跳过: {e}")
+
+        # 4) 组装“依赖上下文”并做 token 限制
+        related_context = "\n\n".join(related_context_blocks).strip()
+        dep_context_max_tokens = int(os.getenv("DEP_CONTEXT_MAX_TOKENS", 1024))
+        if related_context:
+            if count_tokens(related_context) > dep_context_max_tokens:
+                related_context = truncate_text_by_tokens(related_context, dep_context_max_tokens)
+
+        # 5) 拼接进原有 prompt（保持原有格式不变，仅追加上下文提示段）
+        base_user_content = self.prompts["user_message"]["content"].format(
+            diffs_text=diffs_text, commits_text=commits_text
+        )
+
+        if dependencies and related_context:
+            extra = (
+                "\n\n【相关依赖上下文（基于AST解析与向量检索）】\n"
+                f"- 解析到的依赖: {dep_display}\n"
+                "以下是与上述依赖最相关的背景信息（供审查时参考，可能包含约定、调用约束、典型用法/反例等）：\n\n"
+                f"{related_context}\n"
+                "请结合上述上下文进行更准确的代码审查、问题定位与建议输出。"
+            )
+            final_user_content = base_user_content + extra
+        else:
+            final_user_content = base_user_content
+
         messages = [
             self.prompts["system_message"],
-            {
-                "role": "user",
-                "content": self.prompts["user_message"]["content"].format(
-                    diffs_text=diffs_text, commits_text=commits_text
-                ),
-            },
+            {"role": "user", "content": final_user_content},
         ]
         return self.call_llm(messages)
 
